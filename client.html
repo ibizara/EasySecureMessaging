@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Secure Messaging</title>
+    <link rel="stylesheet" href="css/bootstrap.min.css">
+    <script src="js/jquery-3.6.0.min.js"></script>
+    <script src="js/crypto-js.js"></script>
+    <script src="js/purify.min.js"></script>
+    <style>
+        body {
+            padding-bottom: 20px;
+        }
+        .container {
+            margin-top: 0;
+        }
+        #messages {
+            height: 300px;
+            overflow-y: scroll;
+            white-space: pre-wrap;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 class="mt-2">Secure Messaging</h1>
+        <div id="login" class="mt-3">
+            <input type="text" id="username" class="form-control" placeholder="Enter your username">
+            <button class="btn btn-primary mt-2" onclick="setUsername()">Set Username</button>
+        </div>
+        <div id="chat" class="mt-3" style="display: none;">
+            <h3>Users</h3>
+            <ul id="users" class="list-group">
+                <li class="list-group-item" id="no-users">No current users</li>
+            </ul>
+            <h3 class="mt-3">Messages</h3>
+            <div id="messages" class="border p-3"></div>
+            <textarea id="message" class="form-control mt-3" placeholder="Type a message" maxlength="1500" disabled></textarea>
+            <div id="char-count" class="text-right">1500 characters remaining</div>
+            <button class="btn btn-success mt-2" onclick="sendMessage()" disabled>Send</button>
+            <button class="btn btn-secondary mt-2" onclick="clearChat()" disabled>Clear Chat</button>
+            <button class="btn btn-danger mt-2" onclick="remoteClearChat()" disabled>Remote Clear</button>
+        </div>
+        <div id="error" class="text-danger mt-2" style="display: none;"></div>
+        <div id="certificates" class="mt-3" style="display: none;">
+            <h3>Your Verification Code <em>(<span id="current-username-display"></span>)</em></h3>
+            <div id="numerical-value" class="mt-3"></div>
+            <h3 class="mt-3">Recipient Verification Code <em>(<span id="recipient-username-display"></span>)</em></h3>
+            <div id="recipient-numerical-value" class="mt-3"></div>
+        </div>
+    </div>
+
+    <script>
+        // CONFIG START
+        const wsProtocol = 'wss'; // Change to 'ws' for non-SSL connection
+        const wsHost = 'your-server-address';
+        const wsPort = 2644;
+        const wsPath = 'chat';
+        const debug = false;
+        // CONFIG END
+
+        const wsUrl = `${wsProtocol}://${wsHost}:${wsPort}/${wsPath}`;
+        let ws;
+        let username;
+        let passphrase;
+        let publicKey;
+        let privateKey;
+        let selectedUser;
+        let selectedUserPublicKey;
+        const reconnectInterval = 5000; // 5 seconds
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 10;
+
+        function logDebug(message, ...optionalParams) {
+            if (debug) {
+                console.log(message, ...optionalParams);
+            }
+        }
+
+        function logError(message, ...optionalParams) {
+            console.error(message, ...optionalParams);
+        }
+
+        $(document).ready(function () {
+            connectWebSocket();
+
+            $('#username').keypress(function (event) {
+                if (event.which === 13) {
+                    setUsername();
+                }
+            });
+
+            $('#message').on('input', function () {
+                const remaining = 1500 - $(this).val().length;
+                $('#char-count').text(remaining + ' characters remaining');
+                if (remaining < 0) {
+                    $('#char-count').addClass('text-danger');
+                } else {
+                    $('#char-count').removeClass('text-danger');
+                }
+            });
+
+            $('#message').keypress(function (event) {
+                if (event.which === 13 && !event.shiftKey) {
+                    event.preventDefault();
+                    sendMessage();
+                }
+            });
+        });
+
+        function connectWebSocket() {
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = function () {
+                logDebug('WebSocket connection established');
+                reconnectAttempts = 0; // Reset reconnection attempts on successful connection
+            };
+
+            ws.onerror = function (error) {
+                logError('WebSocket error:', error);
+                displayError('WebSocket error occurred. Please try again later.');
+            };
+
+            ws.onmessage = function (event) {
+                const data = JSON.parse(event.data);
+                logDebug('Received data:', data); // Debug logging
+                if (data.type === 'error') {
+                    displayError(data.message);
+                } else if (data.type === 'user_list') {
+                    updateUserList(data.users);
+                } else if (data.type === 'username_set') {
+                    handleUsernameSet();
+                } else {
+                    handleOtherMessages(data);
+                }
+            };
+
+            ws.onclose = function () {
+                logDebug('WebSocket connection closed');
+                if (reconnectAttempts < maxReconnectAttempts) {
+                    setTimeout(connectWebSocket, reconnectInterval);
+                    reconnectAttempts++;
+                } else {
+                    logError('Max reconnection attempts reached');
+                    displayError('Unable to connect to the server. Please try again later.');
+                }
+            };
+        }
+
+        function setUsername() {
+            if (ws.readyState !== WebSocket.OPEN) {
+                logError('WebSocket is not open: readyState=' + ws.readyState);
+                displayError('WebSocket connection is not open. Please wait and try again.');
+                return;
+            }
+            username = $('#username').val().replace(/[^a-z0-9]/gi, '').toLowerCase();
+            if (!username) {
+                displayError('Username is missing or invalid');
+                return;
+            }
+            passphrase = generateRandomPassphrase();
+            logDebug('Setting username:', username);
+            generateCertificates().then(() => {
+                ws.send(JSON.stringify({
+                    type: 'set_username',
+                    username: username,
+                    publicKey: publicKey
+                }));
+            }).catch(error => {
+                displayError('Failed to generate certificates');
+                logError('Certificate generation failed:', error);
+                clearClientState();
+            });
+        }
+
+        function displayError(message) {
+            $('#error').text(message).show();
+        }
+
+        function clearError() {
+            $('#error').hide();
+        }
+
+        function clearClientState() {
+            logDebug('Clearing client state');
+            username = null;
+            passphrase = null;
+            publicKey = null;
+            privateKey = null;
+            selectedUser = null;
+            selectedUserPublicKey = null;
+            localStorage.removeItem('encryptedPrivateKey');
+            $('#username').val('');
+            $('#message').val('').prop('disabled', true);
+            $('#char-count').text('1500 characters remaining');
+            $('button:contains("Send")').prop('disabled', true);
+            $('button:contains("Clear Chat")').prop('disabled', true);
+            $('button:contains("Remote Clear")').prop('disabled', true);
+            $('#messages').empty();
+            $('#users').empty().append('<li class="list-group-item" id="no-users">No current users</li>');
+        }
+
+        function handleUsernameSet() {
+            $('#login').hide();
+            $('#chat').show();
+            $('#certificates').show();
+            $('#current-username-display').text(username);
+            displayNumericalValue('numerical-value', publicKey);
+            clearError();
+        }
+
+        function generateRandomPassphrase() {
+            const array = new Uint8Array(16);
+            window.crypto.getRandomValues(array);
+            return btoa(String.fromCharCode.apply(null, array));
+        }
+
+        function updateUserList(users) {
+            logDebug('Updating user list with:', users); // Debug logging
+            $('#users').empty();
+            const otherUsers = users.filter(user => user !== username); // Exclude current user
+            if (otherUsers.length > 0) {
+                otherUsers.forEach(user => {
+                    $('#users').append(`<li class="list-group-item user-item" onclick="selectUser('${user}')">${user}</li>`);
+                });
+                $('#no-users').hide();
+            } else {
+                $('#users').append('<li class="list-group-item" id="no-users">No current users</li>');
+            }
+            // Reapply the active class to the selected user
+            if (selectedUser && otherUsers.includes(selectedUser)) {
+                $(`#users li`).filter(function () {
+                    return $(this).text() === selectedUser;
+                }).addClass('active');
+            } else {
+                selectedUser = null;
+                selectedUserPublicKey = null;
+                disableMessaging();
+            }
+        }
+
+        function selectUser(user) {
+            selectedUser = user;
+            logDebug('Selected user:', user);
+            $('#users').find('.user-item').removeClass('active'); // Ensure all previous active classes are removed
+            $(`#users li`).filter(function () {
+                return $(this).text() === user;
+            }).addClass('active');
+            // Request the public key for the selected user
+            ws.send(JSON.stringify({
+                type: 'get_public_key',
+                username: user
+            }));
+            // Enable message box and send button
+            $('#message').prop('disabled', false);
+            $('button:contains("Send")').prop('disabled', false);
+            $('button:contains("Clear Chat")').prop('disabled', false);
+            $('button:contains("Remote Clear")').prop('disabled', false);
+        }
+
+        function disableMessaging() {
+            $('#message').prop('disabled', true);
+            $('button:contains("Send")').prop('disabled', true);
+            $('button:contains("Clear Chat")').prop('disabled', true);
+            $('button:contains("Remote Clear")').prop('disabled', true);
+        }
+
+        function sendMessage() {
+            if (ws.readyState !== WebSocket.OPEN) {
+                logError('WebSocket is not open: readyState=' + ws.readyState);
+                displayError('WebSocket connection is not open. Please wait and try again.');
+                return;
+            }
+            const message = $('#message').val();
+            if (message.length > 1500) {  // Client character limit
+                displayError('Message exceeds the maximum allowed length of 1500 characters');
+                return;
+            }
+            if (!message) {
+                displayError('Message cannot be empty');
+                return;
+            }
+            if (selectedUser && selectedUserPublicKey) {
+                logDebug('Encrypting message for:', selectedUser);
+                encryptMessage(message, selectedUserPublicKey).then(encryptedMessage => {
+                    logDebug('Sending encrypted message:', encryptedMessage);
+                    ws.send(JSON.stringify({
+                        type: 'message',
+                        to: selectedUser,
+                        message: encryptedMessage
+                    }));
+                    $('#message').val('');  // Clear the message input field
+                    $('#char-count').text('1500 characters remaining');  // Reset the character countdown
+                    displayMessage('Me', message);
+                }).catch(error => {
+                    displayError('Encryption failed');
+                    logError('Encryption failed:', error);
+                });
+            } else {
+                displayError('Message, selected user, or public key is missing');
+                logError('Message, selected user, or public key is missing');
+            }
+        }
+
+        function displayMessage(from, message) {
+            $('#messages').append(`<div><strong>${from}:</strong> ${message}</div>`);
+            $('#messages').scrollTop($('#messages')[0].scrollHeight);
+        }
+
+        function clearChat() {
+            $('#messages').empty();
+        }
+
+        function remoteClearChat() {
+            clearChat();
+            if (selectedUser) {
+                ws.send(JSON.stringify({
+                    type: 'clear_chat',
+                    to: selectedUser
+                }));
+            }
+        }
+
+        async function generateCertificates() {
+            logDebug('Generating certificates');
+            const keyPair = await window.crypto.subtle.generateKey({
+                name: "RSA-OAEP",
+                modulusLength: 2048,
+                publicExponent: new Uint8Array([0x01, 0x00, 0x01]),
+                hash: { name: "SHA-256" }
+            }, true, ["encrypt", "decrypt"]);
+
+            publicKey = await window.crypto.subtle.exportKey("spki", keyPair.publicKey);
+            privateKey = await window.crypto.subtle.exportKey("pkcs8", keyPair.privateKey);
+
+            const publicKeyBase64 = arrayBufferToBase64(publicKey);
+            const privateKeyBase64 = arrayBufferToBase64(privateKey);
+
+            logDebug('Public Key:', publicKeyBase64);
+            logDebug('Private Key:', privateKeyBase64);
+
+            // Encrypt the private key with the passphrase
+            const encryptedPrivateKey = CryptoJS.AES.encrypt(privateKeyBase64, passphrase).toString();
+            localStorage.setItem('encryptedPrivateKey', encryptedPrivateKey);
+
+            logDebug('Encrypted Private Key:', encryptedPrivateKey);
+
+            // Update publicKey to be sent as a string (base64)
+            publicKey = publicKeyBase64;
+        }
+
+        async function encryptMessage(message, publicKeyBase64) {
+            logDebug('Encrypting message with public key:', publicKeyBase64);
+            const aesKey = window.crypto.getRandomValues(new Uint8Array(16));
+            const aesKeyBase64 = arrayBufferToBase64(aesKey);
+
+            const encryptedAesKey = await window.crypto.subtle.importKey(
+                "spki",
+                base64ToArrayBuffer(publicKeyBase64),
+                { name: "RSA-OAEP", hash: { name: "SHA-256" } },
+                true,
+                ["encrypt"]
+            ).then(importedKey => {
+                return window.crypto.subtle.encrypt(
+                    { name: "RSA-OAEP" },
+                    importedKey,
+                    aesKey
+                );
+            }).then(encryptedBuffer => {
+                return arrayBufferToBase64(encryptedBuffer);
+            }).catch(error => {
+                logError('AES key encryption failed:', error);
+                throw error;
+            });
+
+            const encryptedMessage = CryptoJS.AES.encrypt(message, aesKeyBase64).toString();
+
+            return JSON.stringify({
+                aesKey: encryptedAesKey,
+                message: encryptedMessage
+            });
+        }
+
+        async function decryptMessage(encryptedMessageJson) {
+            try {
+                const encryptedData = JSON.parse(encryptedMessageJson);
+                const encryptedAesKey = base64ToArrayBuffer(encryptedData.aesKey);
+                const encryptedMessage = encryptedData.message;
+
+                const encryptedPrivateKey = localStorage.getItem('encryptedPrivateKey');
+                const privateKeyBase64 = CryptoJS.AES.decrypt(encryptedPrivateKey, passphrase).toString(CryptoJS.enc.Utf8);
+
+                const aesKey = await window.crypto.subtle.importKey(
+                    "pkcs8",
+                    base64ToArrayBuffer(privateKeyBase64),
+                    { name: "RSA-OAEP", hash: { name: "SHA-256" } },
+                    true,
+                    ["decrypt"]
+                ).then(importedKey => {
+                    return window.crypto.subtle.decrypt(
+                        { name: "RSA-OAEP" },
+                        importedKey,
+                        encryptedAesKey
+                    );
+                }).then(decryptedBuffer => {
+                    return arrayBufferToBase64(decryptedBuffer);
+                }).catch(error => {
+                    logError('AES key decryption failed:', error);
+                    throw error;
+                });
+
+                const decryptedMessage = CryptoJS.AES.decrypt(encryptedMessage, aesKey).toString(CryptoJS.enc.Utf8);
+                return decryptedMessage;
+            } catch (error) {
+                logError('Decryption failed:', error);
+                throw error;
+            }
+        }
+
+        function arrayBufferToBase64(buffer) {
+            let binary = '';
+            const bytes = new Uint8Array(buffer);
+            for (let i = 0; i < bytes.byteLength; i++) {
+                binary += String.fromCharCode(bytes[i]);
+            }
+            const base64String = window.btoa(binary);
+            logDebug('Converted ArrayBuffer to Base64:', base64String);
+            return base64String;
+        }
+
+        function base64ToArrayBuffer(base64) {
+            try {
+                logDebug('Converting Base64 to ArrayBuffer:', base64);
+                const binaryString = window.atob(base64);
+                const len = binaryString.length;
+                const bytes = new Uint8Array(len);
+                for (let i = 0; i < len; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+                logDebug('Converted Base64 to ArrayBuffer:', bytes.buffer);
+                return bytes.buffer;
+            } catch (error) {
+                logError('Base64 decoding failed:', error);
+                throw error;
+            }
+        }
+
+        function displayNumericalValue(elementId, publicKey) {
+            const hash = CryptoJS.SHA256(publicKey).toString(CryptoJS.enc.Hex).toUpperCase();
+            const formattedHash = hash.match(/.{1,4}/g).join(' ');
+            $(`#${elementId}`).text(formattedHash);
+        }
+
+        function handleOtherMessages(data) {
+            switch (data.type) {
+                case 'public_key':
+                    selectedUserPublicKey = data.publicKey;
+                    logDebug('Received public key for', selectedUser, selectedUserPublicKey);
+                    displayNumericalValue('recipient-numerical-value', selectedUserPublicKey);
+                    $('#recipient-username-display').text(selectedUser);
+                    break;
+                case 'message':
+                    logDebug('Received encrypted message:', data.message);
+                    decryptMessage(data.message).then(decryptedMessage => {
+                        const sanitizedMessage = DOMPurify.sanitize(decryptedMessage);
+                        displayMessage(data.from, sanitizedMessage);
+                    }).catch(error => {
+                        logError('Decryption failed:', error);
+                    });
+                    break;
+                case 'clear_chat':
+                    clearChat();
+                    break;
+                case 'error':
+                    displayError(data.message);
+                    break;
+                default:
+                    console.warn('Unknown message type:', data.type);
+                    break;
+            }
+        }
+    </script>
+</body>
+</html>
